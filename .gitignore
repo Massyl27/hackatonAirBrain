@@ -1,0 +1,35 @@
+# Data (1.5 GB HDF5 files)
+data/
+*.h5
+airbus_hackathon_trainingdata.zip
+
+# Checkpoints (model weights)
+checkpoints/
+checkpoints_v2/
+checkpoints_v3/
+checkpoints_v4/
+*.pt
+*.pth
+*.onnx
+
+# Outputs (generated CSVs — regenerable)
+outputs/
+
+# BMAD framework
+_bmad/
+_bmad-output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
