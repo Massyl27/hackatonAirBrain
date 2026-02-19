@@ -48,6 +48,20 @@ DBSCAN_PARAMS = {
 CABLE_MERGE_ANGLE_DEG = 15.0
 CABLE_MERGE_GAP_M = 10.0
 
+# Post-processing thresholds (calibrated from GT box stats)
+CONFIDENCE_THRESHOLD = 0.3  # min softmax probability to keep a point prediction
+
+MIN_POINTS_PER_BOX = {1: 5, 2: 3, 3: 4, 4: 10}  # from GT p5
+
+MAX_DIM_PER_CLASS = {  # max single dimension (m) — GT p95 + 50% margin
+    1: 200.0,   # antenna (GT max=129)
+    2: 400.0,   # cable (GT max=300, can be very long)
+    3: 100.0,   # electric_pole (GT max=65)
+    4: 250.0,   # wind_turbine (GT max=167)
+}
+
+NMS_IOU_THRESHOLD = 0.3  # suppress overlapping boxes of same class
+
 # ============================================================================
 # MODEL (inline — exact copy from training notebook v4)
 # ============================================================================
@@ -179,7 +193,8 @@ def read_frame_for_inference(h5_path, start, end, dataset_name="lidar_points"):
 # ============================================================================
 
 @torch.no_grad()
-def predict_frame(model, features_np, device, chunk_size=65536):
+def predict_frame(model, features_np, device, chunk_size=65536,
+                  confidence_threshold=CONFIDENCE_THRESHOLD):
     """Run inference on a full frame, chunked to avoid OOM.
 
     Args:
@@ -187,12 +202,15 @@ def predict_frame(model, features_np, device, chunk_size=65536):
         features_np: (N, 5) numpy array
         device: torch device
         chunk_size: max points per forward pass
+        confidence_threshold: min softmax prob to keep prediction (else → background)
 
     Returns:
         predictions: (N,) numpy int64 — class IDs [0..4]
+        confidences: (N,) numpy float32 — softmax probability of predicted class
     """
     n = len(features_np)
     predictions = np.zeros(n, dtype=np.int64)
+    confidences = np.zeros(n, dtype=np.float32)
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
@@ -208,11 +226,20 @@ def predict_frame(model, features_np, device, chunk_size=65536):
 
         tensor = torch.from_numpy(padded).unsqueeze(0).to(device)  # (1, N, 5)
         logits = model(tensor)  # (1, N, 5)
-        preds = logits[0, :len(chunk)].argmax(dim=-1).cpu().numpy()
-        predictions[start:end] = preds
+        probs = F.softmax(logits[0, :len(chunk)], dim=-1)  # (N, 5)
+        conf, preds = probs.max(dim=-1)
+        preds = preds.cpu().numpy()
+        conf = conf.cpu().numpy()
 
-        del tensor, logits, preds
-    return predictions
+        # Low-confidence obstacle predictions → background
+        low_conf = (preds > 0) & (conf < confidence_threshold)
+        preds[low_conf] = 0
+
+        predictions[start:end] = preds
+        confidences[start:end] = conf
+
+        del tensor, logits, probs, preds, conf
+    return predictions, confidences
 
 # ============================================================================
 # CLUSTERING + BOUNDING BOXES (from build_gt_boxes.py)
@@ -328,11 +355,83 @@ def merge_cable_clusters(clusters):
     return result
 
 # ============================================================================
+# POST-PROCESSING: SIZE FILTER + NMS
+# ============================================================================
+
+def filter_boxes(boxes):
+    """Remove boxes that are too small (few points) or too large (over-merged)."""
+    filtered = []
+    for box in boxes:
+        cid = box["class_id"]
+        # Min points check
+        if box["num_points"] < MIN_POINTS_PER_BOX.get(cid, 3):
+            continue
+        # Max dimension check
+        max_dim = max(box["dimensions"])
+        if max_dim > MAX_DIM_PER_CLASS.get(cid, 500.0):
+            continue
+        filtered.append(box)
+    return filtered
+
+
+def _box_iou_3d(box_a, box_b):
+    """Approximate 3D IoU using axis-aligned overlap of PCA extents.
+
+    Not exact for rotated boxes, but sufficient for NMS between similar objects.
+    """
+    ca, da = box_a["center_xyz"], box_a["dimensions"]
+    cb, db = box_b["center_xyz"], box_b["dimensions"]
+    # Half-extents (approximate — ignore rotation)
+    ha, hb = da / 2.0, db / 2.0
+    # Overlap per axis
+    overlap = np.maximum(0, np.minimum(ca + ha, cb + hb) - np.maximum(ca - ha, cb - hb))
+    inter = overlap[0] * overlap[1] * overlap[2]
+    vol_a = da[0] * da[1] * da[2]
+    vol_b = db[0] * db[1] * db[2]
+    union = vol_a + vol_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def nms_boxes(boxes, iou_threshold=NMS_IOU_THRESHOLD):
+    """Non-Maximum Suppression within each class. Keep box with more points."""
+    if len(boxes) <= 1:
+        return boxes
+
+    # Group by class
+    by_class = {}
+    for box in boxes:
+        by_class.setdefault(box["class_id"], []).append(box)
+
+    result = []
+    for cid, class_boxes in by_class.items():
+        # Sort by num_points descending (most confident first)
+        class_boxes.sort(key=lambda b: b["num_points"], reverse=True)
+        keep = []
+        suppressed = [False] * len(class_boxes)
+        for i in range(len(class_boxes)):
+            if suppressed[i]:
+                continue
+            keep.append(class_boxes[i])
+            for j in range(i + 1, len(class_boxes)):
+                if suppressed[j]:
+                    continue
+                iou = _box_iou_3d(class_boxes[i], class_boxes[j])
+                if iou > iou_threshold:
+                    suppressed[j] = True
+        result.extend(keep)
+    return result
+
+
+# ============================================================================
 # PREDICTIONS → BOUNDING BOXES
 # ============================================================================
 
 def predictions_to_boxes(xyz_m, predictions):
-    """Convert per-point predictions to bounding boxes via DBSCAN + PCA.
+    """Convert per-point predictions to bounding boxes via DBSCAN + PCA + post-processing.
+
+    Pipeline: cluster → PCA bbox → size filter → NMS
 
     Args:
         xyz_m: (N, 3) point positions in meters
@@ -366,6 +465,10 @@ def predictions_to_boxes(xyz_m, predictions):
                 "class_label": CLASS_LABELS_CSV[cid],
                 "num_points": len(pts),
             })
+
+    # Post-processing
+    boxes = filter_boxes(boxes)
+    boxes = nms_boxes(boxes)
     return boxes
 
 # ============================================================================
@@ -399,7 +502,8 @@ def boxes_to_csv_lines(boxes, ego_x, ego_y, ego_z, ego_yaw):
 # MAIN PIPELINE
 # ============================================================================
 
-def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_str):
+def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_str,
+                  conf_threshold=CONFIDENCE_THRESHOLD):
     """Run full inference pipeline on one or multiple HDF5 files."""
 
     device = torch.device(device_str)
@@ -462,8 +566,10 @@ def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_st
                 continue
 
             # Predict
-            predictions = predict_frame(model, features, device, chunk_size=chunk_size)
-            del features
+            predictions, confidences = predict_frame(
+                model, features, device, chunk_size=chunk_size,
+                confidence_threshold=conf_threshold)
+            del features, confidences
 
             # Predictions → boxes
             boxes = predictions_to_boxes(xyz_m, predictions)
@@ -528,6 +634,8 @@ Examples:
                         help="Output directory for CSV predictions")
     parser.add_argument("--chunk-size", type=int, default=65536,
                         help="Max points per forward pass (default: 65536)")
+    parser.add_argument("--conf-threshold", type=float, default=CONFIDENCE_THRESHOLD,
+                        help=f"Min softmax confidence for obstacle predictions (default: {CONFIDENCE_THRESHOLD})")
     parser.add_argument("--device", default="auto",
                         help="Device: 'auto', 'cuda', 'cpu' (default: auto)")
     args = parser.parse_args()
@@ -537,7 +645,7 @@ Examples:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     run_inference(args.input, args.checkpoint, args.output_dir,
-                  args.chunk_size, device)
+                  args.chunk_size, device, args.conf_threshold)
 
 
 if __name__ == "__main__":
