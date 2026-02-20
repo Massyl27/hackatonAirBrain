@@ -63,17 +63,33 @@ BOX_COLORS = {
 }
 
 DBSCAN_PARAMS = {
-    1: {"eps": 2.0, "min_samples": 15},
-    2: {"eps": 5.0, "min_samples": 8},
-    3: {"eps": 2.0, "min_samples": 12},
-    4: {"eps": 5.0, "min_samples": 25},
+    1: {"eps": 2.0, "min_samples": 15},    # Antenna — inchangé
+    2: {"eps": 5.0, "min_samples": 5},     # Cable — baissé (clusters petits)
+    3: {"eps": 2.0, "min_samples": 8},     # Electric pole — baissé
+    4: {"eps": 5.0, "min_samples": 20},    # Wind turbine — baissé légèrement
 }
 
 CABLE_MERGE_ANGLE_DEG = 15.0
 CABLE_MERGE_GAP_M = 10.0
-CONFIDENCE_THRESHOLD = 0.3
 
-MIN_POINTS_PER_BOX = {1: 15, 2: 5, 3: 10, 4: 25}
+# Per-class confidence thresholds
+CONFIDENCE_THRESHOLD_PER_CLASS = {
+    1: 0.40,  # antenna — bon (81 vs 111 GT)
+    2: 0.27,  # cable — calibré (295 vs 285 GT)
+    3: 0.25,  # electric_pole — bon (53 vs 40 GT)
+    4: 0.30,  # wind_turbine — bon (56 vs 70 GT)
+}
+CONFIDENCE_THRESHOLD_DEFAULT = 0.3
+
+BOX_CONFIDENCE_THRESHOLD_PER_CLASS = {
+    1: 0.70,  # antenna — bon (81 boxes)
+    2: 0.55,  # cable — calibré (295 vs 285 GT)
+    3: 0.45,  # electric_pole — bon (53 boxes)
+    4: 0.60,  # wind_turbine — bon (56 boxes)
+}
+BOX_CONFIDENCE_THRESHOLD_DEFAULT = 0.6
+
+MIN_POINTS_PER_BOX = {1: 15, 2: 3, 3: 5, 4: 15}
 MAX_DIM_PER_CLASS = {1: 200.0, 2: 400.0, 3: 100.0, 4: 250.0}
 NMS_IOU_THRESHOLD = 0.3
 
@@ -217,8 +233,11 @@ def predict_frame(model, features_np, device, chunk_size=65536):
         conf, preds = probs.max(dim=-1)
         preds = preds.cpu().numpy()
         conf = conf.cpu().numpy()
-        low_conf = (preds > 0) & (conf < CONFIDENCE_THRESHOLD)
-        preds[low_conf] = 0
+        # Per-class confidence threshold
+        for cid in range(1, 5):
+            thresh = CONFIDENCE_THRESHOLD_PER_CLASS.get(cid, CONFIDENCE_THRESHOLD_DEFAULT)
+            low_conf = (preds == cid) & (conf < thresh)
+            preds[low_conf] = 0
         predictions[start:end] = preds
         confidences[start:end] = conf
         del tensor, logits, probs, preds, conf
@@ -370,10 +389,24 @@ def nms_boxes(boxes, iou_threshold=NMS_IOU_THRESHOLD):
     return result
 
 
-BOX_CONFIDENCE_THRESHOLD = 0.6
+def reclassify_by_geometry(boxes):
+    """Reclassify boxes based on geometric properties."""
+    for box in boxes:
+        if box["class_id"] != 1:
+            continue
+        dims = box["dimensions"]
+        sorted_dims = sorted(dims, reverse=True)
+        longest, middle, shortest = sorted_dims
+        if middle > 0 and longest / middle > 5.0 and shortest < 1.0:
+            box["class_id"] = 2
+            box["class_label"] = CLASS_LABELS_CSV[2]
+        elif longest > 15.0 and box["num_points"] > 200:
+            box["class_id"] = 4
+            box["class_label"] = CLASS_LABELS_CSV[4]
+    return boxes
 
-def predictions_to_boxes(xyz_m, predictions, confidences=None,
-                         box_conf_threshold=BOX_CONFIDENCE_THRESHOLD):
+
+def predictions_to_boxes(xyz_m, predictions, confidences=None):
     boxes = []
     for cid in range(1, 5):
         mask = predictions == cid
@@ -405,8 +438,16 @@ def predictions_to_boxes(xyz_m, predictions, confidences=None,
                 "num_points": len(pts),
                 "confidence": box_confidence,
             })
-    if box_conf_threshold > 0.0:
-        boxes = [b for b in boxes if b["confidence"] >= box_conf_threshold]
+    # Geometric reclassification
+    boxes = reclassify_by_geometry(boxes)
+    # Per-class box confidence filter
+    filtered = []
+    for b in boxes:
+        thresh = BOX_CONFIDENCE_THRESHOLD_PER_CLASS.get(
+            b["class_id"], BOX_CONFIDENCE_THRESHOLD_DEFAULT)
+        if b["confidence"] >= thresh:
+            filtered.append(b)
+    boxes = filtered
     boxes = filter_boxes(boxes)
     boxes = nms_boxes(boxes)
     return boxes

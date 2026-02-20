@@ -42,19 +42,26 @@ CLASS_LABELS_CSV = {1: "Antenna", 2: "Cable", 3: "Electric Pole", 4: "Wind Turbi
 CLASS_ID_TO_AIRBUS = {1: 0, 2: 1, 3: 2, 4: 3}
 
 DBSCAN_PARAMS = {
-    1: {"eps": 2.0, "min_samples": 15},    # Antenna (was 10)
-    2: {"eps": 5.0, "min_samples": 8},     # Cable (was 5)
-    3: {"eps": 2.0, "min_samples": 12},    # Electric pole (was 10)
-    4: {"eps": 5.0, "min_samples": 25},    # Wind turbine (was 15)
+    1: {"eps": 2.0, "min_samples": 15},    # Antenna — inchangé
+    2: {"eps": 5.0, "min_samples": 5},     # Cable — baissé (clusters petits, 13 pts médians GT)
+    3: {"eps": 2.0, "min_samples": 8},     # Electric pole — baissé (21 pts médians GT)
+    4: {"eps": 5.0, "min_samples": 20},    # Wind turbine — baissé légèrement
 }
 
 CABLE_MERGE_ANGLE_DEG = 15.0
 CABLE_MERGE_GAP_M = 10.0
 
 # Post-processing thresholds (calibrated from GT box stats)
-CONFIDENCE_THRESHOLD = 0.3  # min softmax probability to keep a point prediction
+# Per-class confidence threshold: min softmax probability to keep a point prediction
+CONFIDENCE_THRESHOLD_PER_CLASS = {
+    1: 0.40,  # antenna — bon (81 vs 111 GT)
+    2: 0.27,  # cable — calibré (295 vs 285 GT)
+    3: 0.25,  # electric_pole — bon (53 vs 40 GT)
+    4: 0.30,  # wind_turbine — bon (56 vs 70 GT)
+}
+CONFIDENCE_THRESHOLD_DEFAULT = 0.3  # fallback for unknown classes
 
-MIN_POINTS_PER_BOX = {1: 15, 2: 5, 3: 10, 4: 25}  # raised for noisy predictions (below GT p25)
+MIN_POINTS_PER_BOX = {1: 15, 2: 3, 3: 5, 4: 15}  # lowered for cable/pole/turbine (under-detected)
 
 MAX_DIM_PER_CLASS = {  # max single dimension (m) — GT p95 + 50% margin
     1: 200.0,   # antenna (GT max=129)
@@ -197,7 +204,7 @@ def read_frame_for_inference(h5_path, start, end, dataset_name="lidar_points"):
 
 @torch.no_grad()
 def predict_frame(model, features_np, device, chunk_size=65536,
-                  confidence_threshold=CONFIDENCE_THRESHOLD):
+                  confidence_threshold=None):
     """Run inference on a full frame, chunked to avoid OOM.
 
     Args:
@@ -205,7 +212,7 @@ def predict_frame(model, features_np, device, chunk_size=65536,
         features_np: (N, 5) numpy array
         device: torch device
         chunk_size: max points per forward pass
-        confidence_threshold: min softmax prob to keep prediction (else → background)
+        confidence_threshold: unused (kept for API compat), per-class thresholds used instead
 
     Returns:
         predictions: (N,) numpy int64 — class IDs [0..4]
@@ -234,9 +241,11 @@ def predict_frame(model, features_np, device, chunk_size=65536,
         preds = preds.cpu().numpy()
         conf = conf.cpu().numpy()
 
-        # Low-confidence obstacle predictions → background
-        low_conf = (preds > 0) & (conf < confidence_threshold)
-        preds[low_conf] = 0
+        # Per-class confidence threshold: low-confidence obstacle predictions → background
+        for cid in range(1, 5):
+            thresh = CONFIDENCE_THRESHOLD_PER_CLASS.get(cid, CONFIDENCE_THRESHOLD_DEFAULT)
+            low_conf = (preds == cid) & (conf < thresh)
+            preds[low_conf] = 0
 
         predictions[start:end] = preds
         confidences[start:end] = conf
@@ -285,7 +294,7 @@ def _rotate_logits_back(logits, angle_rad):
 
 @torch.no_grad()
 def predict_frame_tta(model, features_np, device, chunk_size=65536,
-                      confidence_threshold=CONFIDENCE_THRESHOLD):
+                      confidence_threshold=None):
     """Test-Time Augmentation: average logits over 4 Z-rotations (0°, 90°, 180°, 270°).
 
     Returns same format as predict_frame: (predictions, confidences).
@@ -311,9 +320,11 @@ def predict_frame_tta(model, features_np, device, chunk_size=65536,
     predictions = probs.argmax(axis=1).astype(np.int64)
     confidences = probs[np.arange(n), predictions].astype(np.float32)
 
-    # Low-confidence obstacle predictions → background
-    low_conf = (predictions > 0) & (confidences < confidence_threshold)
-    predictions[low_conf] = 0
+    # Per-class confidence threshold: low-confidence obstacle predictions → background
+    for cid in range(1, 5):
+        thresh = CONFIDENCE_THRESHOLD_PER_CLASS.get(cid, CONFIDENCE_THRESHOLD_DEFAULT)
+        low_conf = (predictions == cid) & (confidences < thresh)
+        predictions[low_conf] = 0
 
     del avg_logits, probs
     return predictions, confidences
@@ -503,20 +514,50 @@ def nms_boxes(boxes, iou_threshold=NMS_IOU_THRESHOLD):
 
 
 # ============================================================================
+# GEOMETRIC RECLASSIFICATION
+# ============================================================================
+
+def reclassify_by_geometry(boxes):
+    """Reclassify boxes based on geometric properties.
+
+    Fixes common model confusions:
+    - Antenna classified but shape is elongated + flat → likely Cable
+    - Antenna classified but very large + many points → likely Wind Turbine
+    """
+    for box in boxes:
+        if box["class_id"] != 1:  # only reclassify from antenna
+            continue
+        dims = box["dimensions"]
+        sorted_dims = sorted(dims, reverse=True)  # [longest, middle, shortest]
+        longest, middle, shortest = sorted_dims
+
+        # Elongated + flat → Cable (ratio length/width > 5, height < 1m)
+        if middle > 0 and longest / middle > 5.0 and shortest < 1.0:
+            box["class_id"] = 2
+            box["class_label"] = CLASS_LABELS_CSV[2]
+
+        # Very large + many points → Wind Turbine (any dim > 15m and > 200 pts)
+        elif longest > 15.0 and box["num_points"] > 200:
+            box["class_id"] = 4
+            box["class_label"] = CLASS_LABELS_CSV[4]
+
+    return boxes
+
+# ============================================================================
 # PREDICTIONS → BOUNDING BOXES
 # ============================================================================
 
 def predictions_to_boxes(xyz_m, predictions, confidences=None,
-                         box_conf_threshold=0.0):
+                         use_per_class_conf=True):
     """Convert per-point predictions to bounding boxes via DBSCAN + PCA + post-processing.
 
-    Pipeline: cluster → PCA bbox → confidence filter → size filter → NMS
+    Pipeline: cluster → PCA bbox → geometric reclassification → per-class confidence filter → size filter → NMS
 
     Args:
         xyz_m: (N, 3) point positions in meters
         predictions: (N,) class IDs [0..4]
         confidences: (N,) softmax probability of predicted class (optional)
-        box_conf_threshold: min mean confidence to keep a box (0.0 = disabled)
+        use_per_class_conf: if True, use BOX_CONFIDENCE_THRESHOLD_PER_CLASS (default)
 
     Returns:
         list of dicts with keys: center_xyz, dimensions, yaw, class_id, class_label, num_points, confidence
@@ -563,9 +604,18 @@ def predictions_to_boxes(xyz_m, predictions, confidences=None,
                 "confidence": box_confidence,
             })
 
-    # Confidence filter (before size filter and NMS)
-    if box_conf_threshold > 0.0:
-        boxes = [b for b in boxes if b["confidence"] >= box_conf_threshold]
+    # Geometric reclassification (before confidence filter — fixes antenna→cable/turbine)
+    boxes = reclassify_by_geometry(boxes)
+
+    # Per-class box confidence filter
+    if use_per_class_conf:
+        filtered = []
+        for b in boxes:
+            thresh = BOX_CONFIDENCE_THRESHOLD_PER_CLASS.get(
+                b["class_id"], BOX_CONFIDENCE_THRESHOLD_DEFAULT)
+            if b["confidence"] >= thresh:
+                filtered.append(b)
+        boxes = filtered
 
     # Post-processing
     boxes = filter_boxes(boxes)
@@ -604,11 +654,16 @@ def boxes_to_csv_lines(boxes, ego_x, ego_y, ego_z, ego_yaw):
 # MAIN PIPELINE
 # ============================================================================
 
-BOX_CONFIDENCE_THRESHOLD = 0.6  # min mean softmax confidence to keep a box (calibrated on scene_8 val)
+# Per-class box confidence threshold (calibrated on scene_8 val)
+BOX_CONFIDENCE_THRESHOLD_PER_CLASS = {
+    1: 0.70,  # antenna — bon (81 boxes)
+    2: 0.55,  # cable — calibré (295 vs 285 GT)
+    3: 0.45,  # electric_pole — bon (53 boxes)
+    4: 0.60,  # wind_turbine — bon (56 boxes)
+}
+BOX_CONFIDENCE_THRESHOLD_DEFAULT = 0.6  # fallback
 
 def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_str,
-                  conf_threshold=CONFIDENCE_THRESHOLD,
-                  box_conf_threshold=BOX_CONFIDENCE_THRESHOLD,
                   use_tta=False):
     """Run full inference pipeline on one or multiple HDF5 files."""
 
@@ -626,6 +681,10 @@ def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_st
     if "val_obstacle_miou" in ckpt:
         print(f"Checkpoint epoch {ckpt.get('epoch', '?')}, val obstacle mIoU={ckpt['val_obstacle_miou']:.4f}", flush=True)
 
+    # Print per-class thresholds
+    print(f"\nPer-class conf thresholds (point): {CONFIDENCE_THRESHOLD_PER_CLASS}", flush=True)
+    print(f"Per-class conf thresholds (box):   {BOX_CONFIDENCE_THRESHOLD_PER_CLASS}", flush=True)
+
     # --- Collect input files ---
     if os.path.isdir(input_path):
         h5_files = sorted(glob.glob(os.path.join(input_path, "*.h5")))
@@ -637,7 +696,7 @@ def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_st
         sys.exit(1)
 
     predict_fn = predict_frame_tta if use_tta else predict_frame
-    print(f"\nInput: {len(h5_files)} file(s), TTA={'ON' if use_tta else 'OFF'}", flush=True)
+    print(f"Input: {len(h5_files)} file(s), TTA={'ON' if use_tta else 'OFF'}", flush=True)
 
     total_boxes = 0
     total_frames = 0
@@ -672,15 +731,13 @@ def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_st
                 total_frames += 1
                 continue
 
-            # Predict
+            # Predict (per-class thresholds applied internally)
             predictions, confidences = predict_fn(
-                model, features, device, chunk_size=chunk_size,
-                confidence_threshold=conf_threshold)
+                model, features, device, chunk_size=chunk_size)
             del features
 
-            # Predictions → boxes
-            boxes = predictions_to_boxes(xyz_m, predictions, confidences,
-                                         box_conf_threshold=box_conf_threshold)
+            # Predictions → boxes (per-class box confidence + geometric reclassification)
+            boxes = predictions_to_boxes(xyz_m, predictions, confidences)
             del xyz_m, predictions, confidences
 
             # Write CSV
@@ -721,18 +778,23 @@ def run_inference(input_path, checkpoint_path, output_dir, chunk_size, device_st
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LiDAR obstacle detection inference — PointNetSegV4",
+        description="LiDAR obstacle detection inference — PointNetSegV4 (v7 per-class thresholds)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Single scene:
-  python inference.py --input data/scene_8.h5 --checkpoint best_model_v4.pt --output-dir outputs/pred/
+  python inference.py --input data/scene_8.h5 --checkpoint best_model_v5.pt --output-dir outputs/pred/
 
   # All scenes in a directory:
-  python inference.py --input data/ --checkpoint best_model_v4.pt --output-dir outputs/pred/
+  python inference.py --input data/ --checkpoint best_model_v5.pt --output-dir outputs/pred/
+
+  # With TTA (4x slower but more robust):
+  python inference.py --input data/ --checkpoint best_model_v5.pt --output-dir outputs/pred/ --tta
 
   # CPU inference:
-  python inference.py --input data/scene_8.h5 --checkpoint best_model_v4.pt --output-dir outputs/pred/ --device cpu
+  python inference.py --input data/scene_8.h5 --checkpoint best_model_v5.pt --output-dir outputs/pred/ --device cpu
+
+Per-class thresholds are hardcoded in the CONFIG section at the top of this file.
 """)
     parser.add_argument("--input", required=True,
                         help="Path to a single .h5 file or directory containing .h5 files")
@@ -742,10 +804,6 @@ Examples:
                         help="Output directory for CSV predictions")
     parser.add_argument("--chunk-size", type=int, default=65536,
                         help="Max points per forward pass (default: 65536)")
-    parser.add_argument("--conf-threshold", type=float, default=CONFIDENCE_THRESHOLD,
-                        help=f"Min softmax confidence for obstacle predictions (default: {CONFIDENCE_THRESHOLD})")
-    parser.add_argument("--box-conf-threshold", type=float, default=BOX_CONFIDENCE_THRESHOLD,
-                        help=f"Min mean confidence to keep a box (default: {BOX_CONFIDENCE_THRESHOLD})")
     parser.add_argument("--tta", action="store_true",
                         help="Enable Test-Time Augmentation (4x Z-rotations, slower but more robust)")
     parser.add_argument("--device", default="auto",
@@ -757,8 +815,7 @@ Examples:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     run_inference(args.input, args.checkpoint, args.output_dir,
-                  args.chunk_size, device, args.conf_threshold,
-                  args.box_conf_threshold, args.tta)
+                  args.chunk_size, device, args.tta)
 
 
 if __name__ == "__main__":
