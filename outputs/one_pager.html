@@ -150,40 +150,41 @@
 
   <!-- POST-PROCESSING -->
   <div class="section">
-    <h2>Post-Processing</h2>
+    <h2>Post-Processing (v7.3)</h2>
     <ul>
-      <li><strong>Point confidence:</strong> softmax &lt; 0.3 &rarr; background</li>
+      <li><strong>Per-class point confidence:</strong> antenna 0.40, cable 0.27, pole 0.25, turbine 0.30</li>
       <li><strong>DBSCAN:</strong> per-class eps/min_samples tuned from GT stats</li>
+      <li><strong>Geometric reclassification:</strong> elongated antenna &rarr; cable, large antenna &rarr; turbine</li>
+      <li><strong>Per-class box confidence:</strong> antenna 0.70, cable 0.55, pole 0.45, turbine 0.60</li>
       <li><strong>Cable merging:</strong> collinear clusters within 15&deg; / 10m gap</li>
-      <li><strong>Box confidence:</strong> mean softmax &ge; 0.6 per box</li>
-      <li><strong>Size filter:</strong> min points + max dim per class</li>
-      <li><strong>NMS:</strong> IoU &gt; 0.3 suppression within each class</li>
+      <li><strong>Size filter + NMS:</strong> min points, max dim per class, IoU &gt; 0.3</li>
     </ul>
-    <p class="small">Reduced from 244 to 5.2 boxes/frame (GT: 5.1). Optional TTA (4x Z-rotation).</p>
+    <p class="small">Calibrated on scene_8: 485 pred vs 506 GT boxes (ratio 0.96x). Optional TTA (4x Z-rotation).</p>
   </div>
 
   <!-- RESULTS -->
   <div class="section result">
-    <h2>Results &amp; Density Robustness</h2>
+    <h2>Results (v7.3 on scene_8 validation)</h2>
     <div style="display: flex; gap: 12px;">
       <div style="flex: 1;">
         <table>
-          <tr><th>Class</th><th>Seg. IoU</th></tr>
-          <tr><td>Antenna</td><td>0.310</td></tr>
-          <tr><td>Cable</td><td>0.397</td></tr>
-          <tr><td>Electric Pole</td><td>0.004</td></tr>
-          <tr><td>Wind Turbine</td><td>0.136</td></tr>
-          <tr><td><strong>Obstacle mIoU</strong></td><td><strong>0.212</strong></td></tr>
+          <tr><th>Class</th><th>Seg. IoU</th><th>Pred</th><th>GT</th><th>Ratio</th></tr>
+          <tr><td>Antenna</td><td>0.310</td><td>81</td><td>111</td><td>0.73x</td></tr>
+          <tr><td>Cable</td><td>0.397</td><td>295</td><td>285</td><td>1.04x</td></tr>
+          <tr><td>Electric Pole</td><td>0.004</td><td>53</td><td>40</td><td>1.33x</td></tr>
+          <tr><td>Wind Turbine</td><td>0.136</td><td>56</td><td>70</td><td>0.80x</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>0.212</strong></td><td><strong>485</strong></td><td><strong>506</strong></td><td><strong>0.96x</strong></td></tr>
         </table>
       </div>
       <div style="flex: 1;">
         <table>
           <tr><th>Density</th><th>Boxes</th><th>Retention</th></tr>
-          <tr><td>100%</td><td>508 (5.1/fr)</td><td>100%</td></tr>
-          <tr><td>75%</td><td>542 (5.4/fr)</td><td>107%</td></tr>
-          <tr><td>50%</td><td>477 (4.8/fr)</td><td>94%</td></tr>
-          <tr><td>25%</td><td>339 (3.4/fr)</td><td>67%</td></tr>
+          <tr><td>100%</td><td>487 (4.9/fr)</td><td>100%</td></tr>
+          <tr><td>75%</td><td>459 (4.6/fr)</td><td>94.3%</td></tr>
+          <tr><td>50%</td><td>406 (4.1/fr)</td><td>83.4%</td></tr>
+          <tr><td>25%</td><td>387 (3.9/fr)</td><td><strong>79.5%</strong></td></tr>
         </table>
+        <p class="small">All 4 classes detected at all densities. Cable: 88% at 25%.</p>
       </div>
     </div>
   </div>

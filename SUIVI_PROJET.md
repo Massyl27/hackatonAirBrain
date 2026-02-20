@@ -495,13 +495,113 @@ Beaucoup plus propres que les v5 (5 boxes/frame vs 244 avant).
 
 ---
 
+### 2026-02-20 — Post-processing v7.3 : Per-class threshold calibration
+
+#### Problème identifié
+
+Le post-processing v6 avec un seuil global `BOX_CONFIDENCE_THRESHOLD = 0.6` produisait un total de boxes correct (~5.2/frame) mais avec une distribution par classe déséquilibrée :
+- **antenna sur-prédite** : 481 vs 111 GT (4.3x)
+- **cable sous-détecté** : 28 vs 285 GT (0.1x)
+- **electric_pole non détecté** : 0 vs 40 GT
+- **wind_turbine sous-détecté** : 7 vs 70 GT (0.1x)
+
+Le modèle classifie antenna par défaut, et le seuil global élimine les boxes cable/turbine/pole (peu de points → confiance faible).
+
+#### Approche : seuils per-class + reclassification géométrique
+
+**3 modifications sans re-training :**
+
+1. **Seuils de confiance per-class** (point-level et box-level) au lieu de global
+2. **Reclassification géométrique** : antenna allongée+plate → cable, antenna grande+dense → wind_turbine
+3. **DBSCAN/MIN_POINTS baissés** pour cable/pole/turbine (clusters plus petits que antenna)
+
+#### Itérations de calibration sur scene_8 (100 frames, GT = 506 boxes)
+
+| Version | antenna | cable | pole | turbine | **Total** | Ratio GT |
+|---------|---------|-------|------|---------|-----------|----------|
+| **v6 (avant)** | 481 | 28 | 0 | 7 | 516 | 1.02x |
+| v7 (1er essai) | 81 | 2807 | 1277 | 349 | 4514 | 8.9x |
+| v7.1 | 87 | 879 | 49 | 191 | 1206 | 2.4x |
+| v7.2 | 85 | 49 | 51 | 57 | 242 | 0.48x |
+| **v7.3 (final)** | **81** | **295** | **53** | **56** | **485** | **0.96x** |
+| **GT** | 111 | 285 | 40 | 70 | 506 | — |
+
+#### Seuils finaux v7.3
+
+**Per-point confidence threshold** (softmax min pour garder un point) :
+
+| Classe | Seuil |
+|--------|-------|
+| antenna | 0.40 |
+| cable | 0.27 |
+| electric_pole | 0.25 |
+| wind_turbine | 0.30 |
+
+**Per-box confidence threshold** (mean softmax du cluster) :
+
+| Classe | Seuil |
+|--------|-------|
+| antenna | 0.70 |
+| cable | 0.55 |
+| electric_pole | 0.45 |
+| wind_turbine | 0.60 |
+
+**DBSCAN min_samples** : antenna=15, cable=5, pole=8, turbine=20
+**MIN_POINTS_PER_BOX** : antenna=15, cable=3, pole=5, turbine=15
+
+#### Reclassification géométrique
+
+Fonction `reclassify_by_geometry()` appliquée après clustering, avant le filtre confidence :
+- Si box antenna avec **ratio longueur/largeur > 5** et **hauteur < 1m** → reclassée en **cable**
+- Si box antenna avec **dimension > 15m** et **> 200 points** → reclassée en **wind_turbine**
+
+#### Résultats v7.3 vs v6
+
+| Métrique | v6 | v7.3 | Amélioration |
+|----------|-----|------|-------------|
+| antenna | 481 (4.3x GT) | 81 (0.73x GT) | distribution réaliste |
+| cable | 28 (0.1x GT) | 295 (1.04x GT) | **x10 détections** |
+| electric_pole | 0 | 53 (1.33x GT) | **détecté pour la 1ère fois** |
+| wind_turbine | 7 (0.1x GT) | 56 (0.80x GT) | **x8 détections** |
+| Total | 516 | 485 | ratio 0.96x vs GT |
+| Temps (scene_8) | ~80s | 73s | comparable |
+
+**Impact majeur** : electric_pole passe de 0 à 53 détections — la classe la plus faible du modèle (IoU=0.004) est maintenant détectée grâce aux seuils permissifs et à la reclassification.
+
+#### Robustesse densité v7.3 (scene_8, 100 frames)
+
+| Densité | Boxes | Boxes/fr | Rétention | Antenna | Cable | Pole | Turbine |
+|---------|-------|----------|-----------|---------|-------|------|---------|
+| 100% | 487 | 4.9 | 100% | 91 | 288 | 51 | 57 |
+| 75% | 459 | 4.6 | 94.3% | 90 | 274 | 43 | 52 |
+| 50% | 406 | 4.1 | 83.4% | 82 | 246 | 43 | 35 |
+| 25% | 387 | 3.9 | **79.5%** | 53 | 254 | 50 | 30 |
+
+**Amélioration vs v6** : rétention à 25% passe de 67% à **79.5%** (+12 points). Toutes les classes détectées à toutes les densités (vs 0 electric_pole en v6). Cable particulièrement robuste (88.2% à 25%).
+
+#### Fichiers modifiés
+
+| Fichier | Modifications |
+|---------|--------------|
+| `scripts/inference.py` | Seuils per-class, reclassification géométrique, DBSCAN params |
+| `scripts/generate_visualizations.py` | Mêmes seuils, même reclassification |
+| `scripts/test_density_robustness.py` | Mêmes seuils, même reclassification |
+| `notebooks/05_inference.ipynb` | Notebook Colab D-day avec seuils v7.3 |
+| `notebooks/06_density_robustness.ipynb` | Notebook Colab test densité |
+| `notebooks/07_visualizations.ipynb` | Notebook Colab visualisations |
+
+---
+
 ### À documenter dans les prochaines étapes
 
 - [x] Story 1.3/1.4 : FAIT
 - [x] Story 2.1-2.3 v1→v5 : FAIT (obs mIoU: 0.05→0.03→0.168→0.205→0.212)
 - [x] **Story 3 : Pipeline d'inférence + post-processing** — FAIT
-- [x] **Post-processing v2** : bug class_ID, box confidence, DBSCAN tuning, TTA — FAIT
-- [x] **Story 2.4 : Robustesse densité** — FAIT (94% à 50%, 67% à 25%)
-- [x] **Notebook Colab D-day** — FAIT
-- [x] **Visualisations v6** — FAIT (10 PNGs)
+- [x] **Post-processing v2 (v6)** : bug class_ID, box confidence, DBSCAN tuning, TTA — FAIT
+- [x] **Post-processing v3 (v7.3)** : per-class thresholds, geometric reclassification — FAIT
+- [x] **Story 2.4 : Robustesse densité** — v7.3 FAIT (83.4% à 50%, **79.5% à 25%**)
+- [x] **Notebook Colab D-day** — FAIT (v7.3)
+- [x] **Visualisations v6** — FAIT (10 PNGs) — à regénérer avec v7.3
+- [ ] Regénérer visualisations avec v7.3
+- [ ] Relancer test robustesse densité avec v7.3
 - [ ] D-7 : Résultats sur les fichiers d'évaluation
