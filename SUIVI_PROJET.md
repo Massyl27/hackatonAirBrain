@@ -318,11 +318,78 @@ ego_x,ego_y,ego_z,ego_yaw,bbox_center_x,bbox_center_y,bbox_center_z,bbox_width,b
 
 ---
 
+### 2026-02-20 — Post-processing + Training v5
+
+#### Post-processing ajouté au pipeline d'inférence
+
+Améliorations ajoutées à `scripts/inference.py` et `notebooks/05_inference.ipynb` :
+
+| Étape | Paramètre | Description |
+|-------|-----------|-------------|
+| Confidence filter | seuil = 0.3 | Softmax sur les logits, points < 0.3 reclassés en background |
+| Size filter | min_points par classe | Supprime les micro-clusters (bruit DBSCAN) |
+| Size filter | max_dim par classe | Supprime les boxes aberrantes (over-merging) |
+| NMS | IoU > 0.3 | Supprime les doublons, garde le cluster avec le plus de points |
+
+**Seuils calibrés depuis les statistiques GT boxes :**
+
+| Classe | min_points | max_dim (m) |
+|--------|-----------|-------------|
+| antenna | 5 | 80 |
+| cable | 3 | 500 |
+| electric_pole | 5 | 60 |
+| wind_turbine | 10 | 200 |
+
+#### Training v5 — Resume from v4
+
+**Changements v4 → v5 :**
+
+| Aspect | v4 | v5 |
+|--------|----|----|
+| Epochs | 150 (from scratch) | **+150** (resume from v4 best) |
+| LR | 3e-4 | **2e-4** (plus conservateur) |
+| Drop augment | 0-30% | **0-50%** (+ agressif pour robustesse) |
+| Cycle restart | 50 | **75** |
+| GPU | A100 80GB | A100 80GB |
+| Temps | 131.6 min | **130.7 min** |
+
+**Résultats v5 (best epoch 253, soit epoch 103 du fine-tuning) :**
+
+| Classe | v1 | v3 | v4 | **v5** | Tendance |
+|--------|-----|------|--------|--------|----------|
+| background | 0.855 | 0.787 | 0.768 | **0.765** | stable |
+| antenna | 0.005 | 0.290 | 0.256 | **0.310** | +21% |
+| cable | 0.005 | 0.283 | 0.378 | **0.397** | +5% |
+| electric_pole | 0.005 | 0.041 | 0.017 | **0.004** | pire |
+| wind_turbine | 0.199 | 0.059 | 0.170 | **0.136** | -20% |
+| **obstacle mIoU** | 0.05 | 0.168 | 0.205 | **0.212** | **+3.3%** |
+
+- **1,882,693 paramètres** (inchangé)
+- 2 warm restarts effectifs (epoch 228 = epoch 78 du fine-tuning a déclenché le meilleur résultat)
+- Courbe en plateau après epoch 253 — le modèle a convergé
+
+**Analyse v5 :**
+- **antenna** : meilleure performance jamais atteinte (0.310) — le drop augment 0-50% aide la généralisation
+- **cable** : toujours la meilleure classe obstacle (0.397), continue de progresser
+- **electric_pole** : pire résultat de toutes les versions (0.004) — cette classe est structurellement trop difficile (21 pts médians, absent de scene_5)
+- **wind_turbine** : régression vs v4 (0.136 vs 0.170) — possible compromis antenna/turbine
+- **Gain global modeste** (+3.3%) : le modèle approche sa capacité maximale avec cette architecture
+
+**Progression complète :**
+```
+v1 (0.05) → v2 (0.03) → v3 (0.168) → v4 (0.205) → v5 (0.212)
+```
+
+**Fichiers produits :**
+- `notebooks/04_training_v5.ipynb` — notebook standalone pour resume training
+- `checkpoints_v5/best_model_v5.pt` — meilleur modèle (epoch 253, obs mIoU=0.212)
+
+---
+
 ### À documenter dans les prochaines étapes
 
 - [x] Story 1.3/1.4 : FAIT
-- [x] Story 2.1-2.3 v1→v4 : FAIT (obs mIoU: 0.05→0.03→0.168→0.205)
-- [x] **Story 3 : Pipeline d'inférence** — FAIT (scripts/inference.py + notebooks/05_inference.ipynb)
+- [x] Story 2.1-2.3 v1→v5 : FAIT (obs mIoU: 0.05→0.03→0.168→0.205→0.212)
+- [x] **Story 3 : Pipeline d'inférence + post-processing** — FAIT
 - [ ] Story 2.4 : Courbe de robustesse densité (100%→25%)
-- [ ] Itération training v5 (optionnel, si le temps le permet)
 - [ ] D-7 : Résultats sur les fichiers d'évaluation
