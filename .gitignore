@@ -8,12 +8,22 @@ checkpoints/
 checkpoints_v2/
 checkpoints_v3/
 checkpoints_v4/
+checkpoints_v5/
 *.pt
 *.pth
 *.onnx
+*.onnx.data
+
+# Keep deliverables: ONNX model + best checkpoint
+!checkpoints_v5/pointnet_seg_v5.onnx
+!checkpoints_v5/pointnet_seg_v5.onnx.data
+!checkpoints_v5/best_model_v5.pt
 
 # Outputs (generated CSVs — regenerable)
 outputs/
+
+# Keep deliverable: visualizations
+!outputs/visualizations/
 
 # BMAD framework
 _bmad/
