@@ -28,9 +28,12 @@ CLASS_NAMES = {
 CLASS_NAMES_CSV = {
     1: "Antenna",
     2: "Cable",
-    3: "Electric pole",
-    4: "Wind turbine",
+    3: "Electric Pole",
+    4: "Wind Turbine",
 }
+
+# Internal class_id (1-4) → Airbus class_ID (0-3)
+CLASS_ID_TO_AIRBUS = {1: 0, 2: 1, 3: 2, 4: 3}
 
 NUM_CLASSES = 5  # including background (class 0)
 

@@ -386,10 +386,122 @@ v1 (0.05) → v2 (0.03) → v3 (0.168) → v4 (0.205) → v5 (0.212)
 
 ---
 
+### 2026-02-20 — Post-processing v2 : Calibration + Bug fixes + TTA
+
+#### Bug CRITIQUE corrigé : class_ID mapping
+
+| Champ | Avant (INCORRECT) | Après (CORRECT) |
+|-------|-------------------|-----------------|
+| class_ID | 1, 2, 3, 4 | **0, 1, 2, 3** |
+| class_label "Electric pole" | "Electric pole" | **"Electric Pole"** |
+| class_label "Wind turbine" | "Wind turbine" | **"Wind Turbine"** |
+
+**Impact** : 100% des détections auraient été mal classées à l'évaluation Airbus. Corrigé dans `scripts/inference.py`, `scripts/generate_visualizations.py`, `src/config.py`.
+
+#### Améliorations post-processing (v6)
+
+| Changement | Avant | Après | Impact |
+|------------|-------|-------|--------|
+| Box confidence filter | absent | **mean softmax ≥ 0.6** | Réduit faux positifs de ~80% |
+| MIN_POINTS_PER_BOX | {5, 3, 4, 10} | **{15, 5, 10, 25}** | Élimine micro-clusters |
+| DBSCAN min_samples | {10, 5, 10, 15} | **{15, 8, 12, 25}** | Clusters plus denses |
+| TTA (optionnel) | absent | **4x rotation Z** | +robustesse (--tta flag) |
+
+#### Calibration empirique sur scene_8 (validation)
+
+| Seuil box_conf | Boxes/frame | GT (5.1/fr) | Observation |
+|----------------|-------------|-------------|-------------|
+| 0.5 | 27.8 | 5.1 | Trop de faux positifs |
+| **0.6** | **5.2** | **5.1** | **Meilleur match (choisi)** |
+| 0.7 | 1.1 | 5.1 | Trop agressif |
+
+**Résultats scene_8 avec box_conf=0.6 :**
+
+| Classe | GT | Pred | Observation |
+|--------|-----|------|-------------|
+| antenna | 111 | 481 | 4.3x — sur-prédit (modèle confond d'autres classes avec antenna) |
+| cable | 285 | 28 | 0.1x — sous-détecté |
+| electric_pole | 40 | 0 | Non détecté (IoU modèle = 0.004) |
+| wind_turbine | 70 | 7 | 0.1x — sous-détecté |
+
+**Analyse** : Le nombre total de boxes est bien calibré (5.2 vs 5.1/frame GT). Mais la distribution par classe reflète les limites du modèle (mIoU=0.212) — le modèle sur-prédit antenna au détriment des 3 autres classes. L'amélioration la plus importante viendrait d'un meilleur modèle, pas du post-processing.
+
+#### Nouveaux fichiers / scripts
+
+| Fichier | Description |
+|---------|-------------|
+| `scripts/test_density_robustness.py` | Test robustesse densité (100%, 75%, 50%, 25%) |
+
+#### CLI inference.py — nouveaux flags
+
+```bash
+# Avec box confidence filtering (défaut 0.6) :
+python scripts/inference.py --input data/ --checkpoint checkpoints_v5/best_model_v5.pt --output-dir outputs/pred/
+
+# Avec TTA (4x plus lent mais plus robuste) :
+python scripts/inference.py --input data/ --checkpoint checkpoints_v5/best_model_v5.pt --output-dir outputs/pred/ --tta
+
+# Custom thresholds :
+python scripts/inference.py --input data/ --checkpoint checkpoints_v5/best_model_v5.pt --output-dir outputs/pred/ --box-conf-threshold 0.5 --conf-threshold 0.3
+```
+
+#### Test de robustesse densité (critère #3 Airbus)
+
+Sous-échantillonnage aléatoire des points à 75%, 50%, 25% — inference sur scene_8 (100 frames).
+
+| Densité | Boxes | Boxes/frame | Rétention vs 100% | Frames avec détections |
+|---------|-------|-------------|--------------------|-----------------------|
+| **100%** | 508 | 5.1 | 100% | 63 |
+| **75%** | 542 | 5.4 | 107% | 67 |
+| **50%** | 477 | 4.8 | **94%** | 63 |
+| **25%** | 339 | 3.4 | **67%** | 57 |
+
+Distribution par classe à chaque densité :
+
+| Densité | Antenna | Cable | Electric Pole | Wind Turbine |
+|---------|---------|-------|---------------|--------------|
+| 100% | 471 | 30 | 0 | 7 |
+| 75% | 497 | 37 | 0 | 8 |
+| 50% | 447 | 25 | 0 | 5 |
+| 25% | 304 | 31 | 0 | 4 |
+
+**Analyse :**
+- **75% → stable** voire légèrement meilleur (le sous-échantillonnage réduit le bruit pour DBSCAN)
+- **50% → -6%** — bonne robustesse, les détections principales sont préservées
+- **25% → -33%** — dégradation significative mais encore 3.4 boxes/frame
+- **electric_pole = 0** à toutes les densités — le modèle ne sait pas le détecter (IoU=0.004)
+- **antenna domine** (~90% des détections) — le modèle confond les autres classes avec antenna
+
+**Fichiers produits :**
+- `scripts/test_density_robustness.py` — script de test
+- `outputs/density_test/density_report_scene_8.txt` — rapport complet
+
+#### Visualisations v6 (livrable #4)
+
+10 PNGs régénérées avec le post-processing v6 (box confidence 0.6, DBSCAN resserré).
+Beaucoup plus propres que les v5 (5 boxes/frame vs 244 avant).
+
+**Fichiers :** `outputs/visualizations_v6/scene_8_frame*.png`
+
+#### Notebook Colab D-day
+
+`notebooks/05_inference.ipynb` entièrement réécrit pour le jour J :
+- Tout inline (pas de dépendance `src/`)
+- GPU auto-détecté
+- TTA optionnel (`USE_TTA = True/False`)
+- Validation CSV automatique (class_ID 0-3, labels corrects)
+- Checklist jour J intégrée
+- Un seul changement à faire : `INPUT_DIR` → `eval_data/`, `SINGLE_SCENE = None`
+
+---
+
 ### À documenter dans les prochaines étapes
 
 - [x] Story 1.3/1.4 : FAIT
 - [x] Story 2.1-2.3 v1→v5 : FAIT (obs mIoU: 0.05→0.03→0.168→0.205→0.212)
 - [x] **Story 3 : Pipeline d'inférence + post-processing** — FAIT
-- [ ] Story 2.4 : Courbe de robustesse densité (100%→25%)
+- [x] **Post-processing v2** : bug class_ID, box confidence, DBSCAN tuning, TTA — FAIT
+- [x] **Story 2.4 : Robustesse densité** — FAIT (94% à 50%, 67% à 25%)
+- [x] **Notebook Colab D-day** — FAIT
+- [x] **Visualisations v6** — FAIT (10 PNGs)
 - [ ] D-7 : Résultats sur les fichiers d'évaluation

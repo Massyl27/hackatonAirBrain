@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate visualization screenshots — Livrable #4 Airbus.
+Test density robustness — Airbus evaluation criterion #3.
 
-Produces up to 10 PNG images showing point clouds with predicted 3D bounding boxes
-colored by class. Two views per frame: top-down (XY) and side view (XZ).
+Sub-samples point clouds at 100%, 75%, 50%, 25% density and runs inference
+on each, reporting box counts and class distributions per density level.
 
 Usage:
-    python scripts/generate_visualizations.py \
+    python scripts/test_density_robustness.py \
         --input data/scene_8.h5 \
         --checkpoint checkpoints_v5/best_model_v5.pt \
-        --output-dir outputs/visualizations/ \
-        --num-frames 10
+        --output-dir outputs/density_test/
 """
 
 import argparse
@@ -20,11 +19,6 @@ import sys
 import time
 
 import h5py
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,35 +26,15 @@ import torch.nn.functional as F
 from sklearn.cluster import DBSCAN
 
 # ============================================================================
-# CONFIG
+# Reuse inference.py components inline (standalone — no external dependency)
 # ============================================================================
 
 NUM_CLASSES = 5
 IN_CHANNELS = 5
 
-CLASS_NAMES = {0: "Background", 1: "Antenna", 2: "Cable", 3: "Electric pole", 4: "Wind turbine"}
+CLASS_NAMES = {0: "background", 1: "antenna", 2: "cable", 3: "electric_pole", 4: "wind_turbine"}
 
 CLASS_LABELS_CSV = {1: "Antenna", 2: "Cable", 3: "Electric Pole", 4: "Wind Turbine"}
-
-# Internal class_id (1-4) → Airbus class_ID (0-3)
-CLASS_ID_TO_AIRBUS = {1: 0, 2: 1, 3: 2, 4: 3}
-
-# Colors for visualization (RGBA)
-CLASS_COLORS = {
-    0: (0.7, 0.7, 0.7, 0.05),    # background — very transparent grey
-    1: (0.15, 0.09, 0.71, 0.9),   # antenna — blue (from RGB 38,23,180)
-    2: (0.69, 0.52, 0.18, 0.9),   # cable — gold (from RGB 177,132,47)
-    3: (0.51, 0.32, 0.38, 0.9),   # electric pole — mauve (from RGB 129,81,97)
-    4: (0.26, 0.52, 0.04, 0.9),   # wind turbine — green (from RGB 66,132,9)
-}
-
-# Bounding box edge colors (opaque, vivid)
-BOX_COLORS = {
-    1: "#2617B4",   # antenna — blue
-    2: "#B18430",   # cable — gold
-    3: "#815161",   # electric pole — mauve
-    4: "#428409",   # wind turbine — green
-}
 
 DBSCAN_PARAMS = {
     1: {"eps": 2.0, "min_samples": 15},
@@ -72,15 +46,12 @@ DBSCAN_PARAMS = {
 CABLE_MERGE_ANGLE_DEG = 15.0
 CABLE_MERGE_GAP_M = 10.0
 CONFIDENCE_THRESHOLD = 0.3
-
+BOX_CONFIDENCE_THRESHOLD = 0.6
 MIN_POINTS_PER_BOX = {1: 15, 2: 5, 3: 10, 4: 25}
 MAX_DIM_PER_CLASS = {1: 200.0, 2: 400.0, 3: 100.0, 4: 250.0}
 NMS_IOU_THRESHOLD = 0.3
 
-# ============================================================================
-# MODEL (inline copy)
-# ============================================================================
-
+# --- Model ---
 class SharedMLP(nn.Module):
     def __init__(self, in_ch, out_ch, bn=True):
         super().__init__()
@@ -91,7 +62,6 @@ class SharedMLP(nn.Module):
         if self.bn:
             x = self.bn(x)
         return F.relu(x, inplace=True)
-
 
 class PointNetSegV4(nn.Module):
     def __init__(self, in_channels=5, num_classes=5):
@@ -126,10 +96,7 @@ class PointNetSegV4(nn.Module):
         seg = self.head(seg)
         return seg.transpose(1, 2)
 
-# ============================================================================
-# HDF5 READER
-# ============================================================================
-
+# --- HDF5 reader ---
 def get_frame_boundaries(h5_path, dataset_name="lidar_points", chunk_size=2_000_000):
     change_indices = []
     with h5py.File(h5_path, "r") as f:
@@ -181,24 +148,14 @@ def read_frame_for_inference(h5_path, start, end, dataset_name="lidar_points"):
     refl_norm = (valid["reflectivity"].astype(np.float32) / 255.0).reshape(-1, 1)
     dist_norm = (dist_m.astype(np.float32) / 300.0).reshape(-1, 1)
     features = np.concatenate([xyz, refl_norm, dist_norm], axis=1)
-
-    # Also read GT labels for comparison
-    r, g, b = valid["r"].astype(int), valid["g"].astype(int), valid["b"].astype(int)
-    gt_labels = np.zeros(len(valid), dtype=np.int64)
-    gt_labels[(r == 38) & (g == 23) & (b == 180)] = 1   # antenna
-    gt_labels[(r == 177) & (g == 132) & (b == 47)] = 2   # cable
-    gt_labels[(r == 129) & (g == 81) & (b == 97)] = 3    # electric_pole
-    gt_labels[(r == 66) & (g == 132) & (b == 9)] = 4     # wind_turbine
-
     del valid, dist_m, az_rad, el_rad, cos_el, x, y, z
-    return xyz, features, gt_labels
+    return xyz, features
 
-# ============================================================================
-# INFERENCE
-# ============================================================================
 
+# --- Inference ---
 @torch.no_grad()
-def predict_frame(model, features_np, device, chunk_size=65536):
+def predict_frame(model, features_np, device, chunk_size=65536,
+                  confidence_threshold=CONFIDENCE_THRESHOLD):
     n = len(features_np)
     predictions = np.zeros(n, dtype=np.int64)
     confidences = np.zeros(n, dtype=np.float32)
@@ -217,17 +174,15 @@ def predict_frame(model, features_np, device, chunk_size=65536):
         conf, preds = probs.max(dim=-1)
         preds = preds.cpu().numpy()
         conf = conf.cpu().numpy()
-        low_conf = (preds > 0) & (conf < CONFIDENCE_THRESHOLD)
+        low_conf = (preds > 0) & (conf < confidence_threshold)
         preds[low_conf] = 0
         predictions[start:end] = preds
         confidences[start:end] = conf
         del tensor, logits, probs, preds, conf
     return predictions, confidences
 
-# ============================================================================
-# CLUSTERING + BOUNDING BOXES
-# ============================================================================
 
+# --- Clustering / boxes (simplified — just count boxes) ---
 def pca_oriented_bbox(points_m):
     center_xyz = points_m.mean(axis=0)
     centered = points_m - center_xyz
@@ -370,8 +325,6 @@ def nms_boxes(boxes, iou_threshold=NMS_IOU_THRESHOLD):
     return result
 
 
-BOX_CONFIDENCE_THRESHOLD = 0.6
-
 def predictions_to_boxes(xyz_m, predictions, confidences=None,
                          box_conf_threshold=BOX_CONFIDENCE_THRESHOLD):
     boxes = []
@@ -384,16 +337,14 @@ def predictions_to_boxes(xyz_m, predictions, confidences=None,
         clusters = cluster_class_points(class_points, cid)
         if cid == 2 and len(clusters) > 1:
             clusters = merge_cable_clusters(clusters)
-        conf_tree = None
-        if class_conf is not None and len(clusters) > 0:
-            from sklearn.neighbors import BallTree
-            conf_tree = BallTree(class_points)
         for pts in clusters:
             if len(pts) < 3:
                 continue
             box_confidence = 0.0
-            if conf_tree is not None:
-                _, indices = conf_tree.query(pts, k=1)
+            if class_conf is not None:
+                from sklearn.neighbors import BallTree
+                tree = BallTree(class_points)
+                _, indices = tree.query(pts, k=1)
                 box_confidence = float(class_conf[indices.ravel()].mean())
             bbox = pca_oriented_bbox(pts)
             boxes.append({
@@ -411,183 +362,35 @@ def predictions_to_boxes(xyz_m, predictions, confidences=None,
     boxes = nms_boxes(boxes)
     return boxes
 
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
-def draw_rotated_box_2d(ax, cx, cy, w, h, yaw, color, linewidth=2):
-    """Draw a rotated rectangle on a 2D matplotlib axes."""
-    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    # 4 corners of the box before rotation
-    corners = np.array([
-        [-w/2, -h/2],
-        [+w/2, -h/2],
-        [+w/2, +h/2],
-        [-w/2, +h/2],
-        [-w/2, -h/2],  # close the box
-    ])
-    # Rotate
-    rot = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
-    rotated = corners @ rot.T
-    rotated[:, 0] += cx
-    rotated[:, 1] += cy
-    ax.plot(rotated[:, 0], rotated[:, 1], color=color, linewidth=linewidth, solid_capstyle='round')
-
-
-def render_frame(xyz_m, predictions, boxes, frame_idx, ego_info, output_path,
-                 max_display_points=100000):
-    """Render a frame with two views: top-down (XY) and side (XZ)."""
-
-    # Subsample points for display
-    if len(xyz_m) > max_display_points:
-        idx = np.random.choice(len(xyz_m), max_display_points, replace=False)
-        xyz_disp = xyz_m[idx]
-        pred_disp = predictions[idx]
-    else:
-        xyz_disp = xyz_m
-        pred_disp = predictions
-
-    # Assign colors to points
-    colors = np.array([CLASS_COLORS[p] for p in pred_disp])
-
-    fig, axes = plt.subplots(1, 2, figsize=(20, 9))
-
-    ego_x, ego_y, ego_z, ego_yaw = ego_info
-
-    # --- Top-down view (XY) ---
-    ax = axes[0]
-    # Background points first (below), then obstacle points on top
-    bg_mask = pred_disp == 0
-    obs_mask = ~bg_mask
-
-    ax.scatter(xyz_disp[bg_mask, 0], xyz_disp[bg_mask, 1],
-               c=colors[bg_mask], s=0.1, rasterized=True)
-    ax.scatter(xyz_disp[obs_mask, 0], xyz_disp[obs_mask, 1],
-               c=colors[obs_mask], s=1.5, rasterized=True)
-
-    # Draw bounding boxes (top-down: use X, Y, width, length, yaw)
-    for box in boxes:
-        c = box["center_xyz"]
-        d = box["dimensions"]
-        draw_rotated_box_2d(ax, c[0], c[1], d[0], d[1], box["yaw"],
-                           color=BOX_COLORS[box["class_id"]], linewidth=2.5)
-
-    ax.set_xlabel("X (m)", fontsize=11)
-    ax.set_ylabel("Y (m)", fontsize=11)
-    ax.set_title("Top-down view (XY)", fontsize=13, fontweight="bold")
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-
-    # --- Side view (XZ) ---
-    ax = axes[1]
-    ax.scatter(xyz_disp[bg_mask, 0], xyz_disp[bg_mask, 2],
-               c=colors[bg_mask], s=0.1, rasterized=True)
-    ax.scatter(xyz_disp[obs_mask, 0], xyz_disp[obs_mask, 2],
-               c=colors[obs_mask], s=1.5, rasterized=True)
-
-    # Draw bounding boxes (side: use X, Z, width, height, no rotation)
-    for box in boxes:
-        c = box["center_xyz"]
-        d = box["dimensions"]
-        # Side view: axis-aligned rectangle (X, Z)
-        rect = patches.Rectangle(
-            (c[0] - d[0]/2, c[2] - d[2]/2), d[0], d[2],
-            linewidth=2.5, edgecolor=BOX_COLORS[box["class_id"]],
-            facecolor="none", linestyle="-"
-        )
-        ax.add_patch(rect)
-
-    ax.set_xlabel("X (m)", fontsize=11)
-    ax.set_ylabel("Z (m)", fontsize=11)
-    ax.set_title("Side view (XZ)", fontsize=13, fontweight="bold")
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-
-    # Legend
-    legend_elements = [
-        Line2D([0], [0], color=BOX_COLORS[1], linewidth=3, label=f"Antenna ({sum(1 for b in boxes if b['class_id']==1)})"),
-        Line2D([0], [0], color=BOX_COLORS[2], linewidth=3, label=f"Cable ({sum(1 for b in boxes if b['class_id']==2)})"),
-        Line2D([0], [0], color=BOX_COLORS[3], linewidth=3, label=f"Electric pole ({sum(1 for b in boxes if b['class_id']==3)})"),
-        Line2D([0], [0], color=BOX_COLORS[4], linewidth=3, label=f"Wind turbine ({sum(1 for b in boxes if b['class_id']==4)})"),
-    ]
-    fig.legend(handles=legend_elements, loc="lower center", ncol=4, fontsize=11,
-               frameon=True, fancybox=True, shadow=True)
-
-    # Title
-    n_obs = sum(1 for p in predictions if p > 0)
-    fig.suptitle(
-        f"Frame {frame_idx} — {len(boxes)} detections — "
-        f"{n_obs:,} obstacle pts / {len(predictions):,} total — "
-        f"PointNetSegV4 (v5, mIoU=0.212)",
-        fontsize=14, fontweight="bold", y=0.98
-    )
-
-    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"  Saved: {output_path}", flush=True)
-
 
 # ============================================================================
-# FRAME SELECTION — pick diverse frames
+# DENSITY TEST
 # ============================================================================
 
-def select_diverse_frames(all_frame_results, num_frames=10):
-    """Select frames that showcase different class combinations and box counts."""
-    if len(all_frame_results) <= num_frames:
-        return all_frame_results
+def subsample_features(xyz_m, features, density_pct):
+    """Randomly subsample points to simulate reduced density."""
+    if density_pct >= 100:
+        return xyz_m, features
+    n = len(xyz_m)
+    k = max(1, int(n * density_pct / 100.0))
+    idx = np.random.choice(n, k, replace=False)
+    idx.sort()
+    return xyz_m[idx], features[idx]
 
-    # Sort by number of distinct classes detected (descending), then by box count
-    scored = []
-    for fr in all_frame_results:
-        classes_present = set(b["class_id"] for b in fr["boxes"])
-        scored.append((len(classes_present), len(fr["boxes"]), fr))
-
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    selected = []
-    seen_class_combos = set()
-
-    # First pass: pick frames with unique class combinations
-    for n_cls, n_box, fr in scored:
-        if len(selected) >= num_frames:
-            break
-        combo = frozenset(b["class_id"] for b in fr["boxes"])
-        if combo not in seen_class_combos:
-            selected.append(fr)
-            seen_class_combos.add(combo)
-
-    # Second pass: fill remaining slots with highest box count frames
-    if len(selected) < num_frames:
-        selected_indices = set(fr["frame_idx"] for fr in selected)
-        for n_cls, n_box, fr in scored:
-            if len(selected) >= num_frames:
-                break
-            if fr["frame_idx"] not in selected_indices:
-                selected.append(fr)
-                selected_indices.add(fr["frame_idx"])
-
-    return selected
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate visualization screenshots (Livrable #4)")
-    parser.add_argument("--input", required=True, help="Path to .h5 file")
+    parser = argparse.ArgumentParser(description="Test density robustness (criterion #3)")
+    parser.add_argument("--input", required=True, help="Path to .h5 scene file")
     parser.add_argument("--checkpoint", required=True, help="Path to model .pt checkpoint")
-    parser.add_argument("--output-dir", default="outputs/visualizations/", help="Output directory for PNGs")
-    parser.add_argument("--num-frames", type=int, default=10, help="Number of frames to visualize")
+    parser.add_argument("--output-dir", default="outputs/density_test/", help="Output directory")
     parser.add_argument("--device", default="auto", help="Device: auto, cuda, cpu")
+    parser.add_argument("--max-frames", type=int, default=0, help="Max frames to process (0=all)")
     args = parser.parse_args()
 
     device_str = args.device
     if device_str == "auto":
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
-
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load model
@@ -596,80 +399,94 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"PointNetSegV4: {n_params:,} params on {device}", flush=True)
+    print(f"Model loaded on {device}", flush=True)
 
-    # Get frame boundaries
-    print(f"\nReading frame boundaries from {args.input}...", flush=True)
+    # Get frames
     frames_info = get_frame_boundaries(args.input)
     n_frames = len(frames_info)
-    print(f"Found {n_frames} frames", flush=True)
+    if args.max_frames > 0:
+        n_frames = min(n_frames, args.max_frames)
+    print(f"Testing on {n_frames} frames from {args.input}", flush=True)
 
-    # Run inference on ALL frames to find the best ones
-    print(f"\nRunning inference on all {n_frames} frames to select best {args.num_frames}...", flush=True)
-    all_results = []
-    t0 = time.time()
+    densities = [100, 75, 50, 25]
+    results = {d: {"total_boxes": 0, "class_counts": {1: 0, 2: 0, 3: 0, 4: 0},
+                    "frames_with_boxes": 0, "total_points": 0}
+               for d in densities}
+
+    scene_name = os.path.splitext(os.path.basename(args.input))[0]
+    t_start = time.time()
 
     for idx in range(n_frames):
         start, end, ego_x, ego_y, ego_z, ego_yaw = frames_info[idx]
-        xyz_m, features, gt_labels = read_frame_for_inference(args.input, start, end)
+        xyz_m, features = read_frame_for_inference(args.input, start, end)
         if len(xyz_m) == 0:
             continue
 
-        predictions, confidences = predict_frame(model, features, device)
-        boxes = predictions_to_boxes(xyz_m, predictions, confidences)
+        for density in densities:
+            np.random.seed(42 + idx)  # Reproducible per frame
+            xyz_sub, feat_sub = subsample_features(xyz_m, features, density)
 
-        if boxes:  # Only consider frames with detections
-            all_results.append({
-                "frame_idx": idx,
-                "xyz_m": xyz_m,
-                "predictions": predictions,
-                "boxes": boxes,
-                "ego_info": (ego_x, ego_y, ego_z, ego_yaw),
-            })
-        else:
-            del xyz_m, predictions
-            gc.collect()
+            predictions, confidences = predict_frame(model, feat_sub, device)
+            boxes = predictions_to_boxes(xyz_sub, predictions, confidences)
 
-        if (idx + 1) % 20 == 0:
-            print(f"  {idx+1}/{n_frames} frames processed, {len(all_results)} with detections", flush=True)
+            r = results[density]
+            r["total_boxes"] += len(boxes)
+            r["total_points"] += len(xyz_sub)
+            if boxes:
+                r["frames_with_boxes"] += 1
+            for box in boxes:
+                r["class_counts"][box["class_id"]] += 1
 
-    elapsed = time.time() - t0
-    print(f"\nInference done: {len(all_results)} frames with detections ({elapsed:.0f}s)", flush=True)
+            del xyz_sub, feat_sub, predictions, confidences, boxes
 
-    # Select diverse frames
-    selected = select_diverse_frames(all_results, args.num_frames)
-    print(f"Selected {len(selected)} frames for visualization", flush=True)
-
-    # Free unselected frames
-    selected_indices = set(fr["frame_idx"] for fr in selected)
-    for fr in all_results:
-        if fr["frame_idx"] not in selected_indices:
-            del fr["xyz_m"], fr["predictions"], fr["boxes"]
-    gc.collect()
-
-    # Render selected frames
-    print(f"\nRendering visualizations...", flush=True)
-    scene_name = os.path.splitext(os.path.basename(args.input))[0]
-
-    for i, fr in enumerate(selected):
-        filename = f"{scene_name}_frame{fr['frame_idx']:03d}.png"
-        output_path = os.path.join(args.output_dir, filename)
-
-        classes_in_frame = sorted(set(b["class_id"] for b in fr["boxes"]))
-        class_names = [CLASS_NAMES[c] for c in classes_in_frame]
-        print(f"\n  [{i+1}/{len(selected)}] Frame {fr['frame_idx']}: "
-              f"{len(fr['boxes'])} boxes ({', '.join(class_names)})", flush=True)
-
-        render_frame(
-            fr["xyz_m"], fr["predictions"], fr["boxes"],
-            fr["frame_idx"], fr["ego_info"], output_path
-        )
-
-        del fr["xyz_m"], fr["predictions"]
+        del xyz_m, features
         gc.collect()
 
-    print(f"\nDone! {len(selected)} visualizations saved to {args.output_dir}/", flush=True)
+        if (idx + 1) % 10 == 0 or idx == n_frames - 1:
+            elapsed = time.time() - t_start
+            print(f"  {idx+1}/{n_frames} frames ({elapsed:.0f}s)", flush=True)
+
+    # Report
+    elapsed = time.time() - t_start
+    print(f"\n{'='*70}", flush=True)
+    print(f"DENSITY ROBUSTNESS TEST — {scene_name} — {n_frames} frames ({elapsed:.0f}s)", flush=True)
+    print(f"{'='*70}", flush=True)
+
+    header = f"{'Density':>10} | {'Boxes':>8} | {'Boxes/fr':>8} | {'FrWithBox':>9} | {'Antenna':>8} | {'Cable':>8} | {'ElecPole':>8} | {'WindTurb':>8}"
+    print(header, flush=True)
+    print("-" * len(header), flush=True)
+
+    report_lines = [header, "-" * len(header)]
+    ref_boxes = None
+
+    for density in densities:
+        r = results[density]
+        avg = r["total_boxes"] / max(n_frames, 1)
+        cc = r["class_counts"]
+        line = (f"{density:>9}% | {r['total_boxes']:>8} | {avg:>8.1f} | {r['frames_with_boxes']:>9} | "
+                f"{cc[1]:>8} | {cc[2]:>8} | {cc[3]:>8} | {cc[4]:>8}")
+        print(line, flush=True)
+        report_lines.append(line)
+        if density == 100:
+            ref_boxes = r["total_boxes"]
+
+    print(f"\nRetention rates vs 100% density:", flush=True)
+    report_lines.append(f"\nRetention rates vs 100% density:")
+    for density in densities:
+        r = results[density]
+        rate = r["total_boxes"] / max(ref_boxes, 1) * 100
+        line = f"  {density}% density → {rate:.1f}% of boxes retained"
+        print(line, flush=True)
+        report_lines.append(line)
+
+    # Save report
+    report_path = os.path.join(args.output_dir, f"density_report_{scene_name}.txt")
+    with open(report_path, "w") as f:
+        f.write(f"Density Robustness Test — {scene_name}\n")
+        f.write(f"Frames: {n_frames}, Time: {elapsed:.0f}s\n\n")
+        for line in report_lines:
+            f.write(line + "\n")
+    print(f"\nReport saved: {report_path}", flush=True)
 
 
 if __name__ == "__main__":
