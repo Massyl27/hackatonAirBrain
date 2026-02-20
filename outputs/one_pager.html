@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AirBrain — LiDAR Obstacle Detection | Airbus AI Hackathon 2026</title>
+<style>
+  @page { size: A4 landscape; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+    width: 297mm; height: 210mm;
+    padding: 10mm 14mm 8mm 14mm;
+    color: #1a1a2e;
+    background: #fff;
+    font-size: 8.5pt;
+    line-height: 1.28;
+    overflow: hidden;
+  }
+
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 2.5px solid #00205B; padding-bottom: 4px; margin-bottom: 7px;
+  }
+  .header h1 { font-size: 19pt; color: #00205B; letter-spacing: -0.5px; }
+  .header .subtitle { font-size: 8.5pt; color: #555; }
+  .header .team { text-align: right; font-size: 8.5pt; color: #333; }
+  .header .team strong { color: #00205B; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .full { grid-column: 1 / -1; }
+
+  .section {
+    background: #f7f8fc; border-radius: 5px; padding: 6px 9px;
+    border-left: 3px solid #00205B;
+  }
+  .section h2 {
+    font-size: 8.5pt; color: #00205B; margin-bottom: 3px;
+    text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;
+  }
+  .section.highlight { background: #e8f0fe; border-left-color: #1a73e8; }
+  .section.result { background: #e6f4ea; border-left-color: #1e8e3e; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 8pt; }
+  th { background: #00205B; color: #fff; padding: 2px 5px; text-align: left; font-weight: 600; }
+  td { padding: 2px 5px; border-bottom: 1px solid #ddd; }
+  tr:nth-child(even) td { background: #f0f2f8; }
+
+  .pipeline {
+    display: flex; align-items: center; justify-content: center;
+    gap: 0; font-size: 7.5pt; margin: 4px 0;
+  }
+  .pipeline .step {
+    background: #00205B; color: #fff; padding: 3px 7px;
+    border-radius: 3px; text-align: center; white-space: nowrap;
+  }
+  .pipeline .arrow { color: #00205B; font-size: 12pt; margin: 0 2px; }
+
+  .footer {
+    margin-top: 5px; text-align: center;
+    font-size: 7.5pt; color: #777; border-top: 1px solid #ddd; padding-top: 3px;
+  }
+
+  ul { padding-left: 14px; }
+  li { margin-bottom: 1px; }
+  .param-count { font-size: 15pt; font-weight: 700; color: #1e8e3e; }
+  .small { font-size: 7.5pt; color: #666; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>AirBrain — LiDAR 3D Obstacle Detection</h1>
+    <div class="subtitle">Real-time helicopter collision prevention using deep learning on LiDAR point clouds</div>
+  </div>
+  <div class="team">
+    <strong>Team AirBrain</strong><br>
+    Quentin, Massyl &amp; Ghania<br>
+    Airbus AI Hackathon 2026
+  </div>
+</div>
+
+<div class="grid">
+
+  <!-- APPROACH -->
+  <div class="section">
+    <h2>Approach</h2>
+    <p><strong>PointNetSegV4</strong> — Point-wise segmentation + geometric clustering + bounding box estimation.</p>
+    <div class="pipeline">
+      <span class="step">HDF5</span>
+      <span class="arrow">&rarr;</span>
+      <span class="step">Sph&rarr;Cart</span>
+      <span class="arrow">&rarr;</span>
+      <span class="step">PointNet Seg</span>
+      <span class="arrow">&rarr;</span>
+      <span class="step">DBSCAN</span>
+      <span class="arrow">&rarr;</span>
+      <span class="step">PCA BBox</span>
+      <span class="arrow">&rarr;</span>
+      <span class="step">NMS+Filter</span>
+    </div>
+    <ul>
+      <li><strong>Input:</strong> 5 features/point (x, y, z, reflectivity, distance)</li>
+      <li><strong>Backbone:</strong> Multi-scale encoder (64&rarr;128&rarr;256&rarr;512&rarr;1024) + skip connections</li>
+      <li><strong>Output:</strong> 5-class segmentation (background + 4 obstacle classes)</li>
+    </ul>
+  </div>
+
+  <!-- FINAL MODEL -->
+  <div class="section highlight">
+    <h2>Final Model</h2>
+    <div style="text-align:center; margin: 2px 0;">
+      <span class="param-count">1,882,693 parameters</span>
+    </div>
+    <table>
+      <tr><th>Property</th><th>Value</th></tr>
+      <tr><td>Architecture</td><td>PointNetSegV4 (multi-scale skip connections)</td></tr>
+      <tr><td>Format</td><td>PyTorch (.pt) + ONNX (0.03 MB)</td></tr>
+      <tr><td>Training</td><td>A100 80GB, 282 min total (5 iterations)</td></tr>
+      <tr><td>Inference</td><td>~1.3 min / 100 frames (T4 GPU)</td></tr>
+    </table>
+  </div>
+
+  <!-- TRAINING CHOICES -->
+  <div class="section">
+    <h2>Training Choices</h2>
+    <table>
+      <tr><th>Choice</th><th>Why</th></tr>
+      <tr><td><strong>Class-balanced sampling</strong></td><td>Only 5% of points are obstacles &mdash; forced 50/50 ratio, equal per class</td></tr>
+      <tr><td><strong>Focal Loss</strong> (&gamma;=2)</td><td>Reduces background contribution, focuses on rare classes</td></tr>
+      <tr><td><strong>Cosine warm restarts</strong></td><td>Escapes local minima &mdash; best model at epoch 253</td></tr>
+      <tr><td><strong>Drop augmentation</strong> (0-50%)</td><td>Simulates reduced density for 25/50/75% robustness</td></tr>
+      <tr><td><strong>Validation: scene_8</strong></td><td>Highest class diversity (entropy 4.72) among 10 scenes</td></tr>
+    </table>
+  </div>
+
+  <!-- MODELS TESTED -->
+  <div class="section">
+    <h2>Models Tested</h2>
+    <table>
+      <tr><th>Ver.</th><th>Params</th><th>Key Change</th><th>Obs. mIoU</th></tr>
+      <tr><td>v1</td><td>116K</td><td>Baseline PointNet-lite</td><td>0.054</td></tr>
+      <tr><td>v2</td><td>116K</td><td>+ Focal Loss</td><td>0.027</td></tr>
+      <tr><td>v3</td><td>454K</td><td>+ Balanced sampling</td><td>0.168</td></tr>
+      <tr><td>v4</td><td>1.88M</td><td>+ Larger backbone, class-balanced</td><td>0.205</td></tr>
+      <tr><td><strong>v5</strong></td><td><strong>1.88M</strong></td><td><strong>+ Fine-tuning, drop augment 50%</strong></td><td><strong>0.212</strong></td></tr>
+    </table>
+    <p class="small">Key insight: balanced sampling (v3) = single biggest gain (+0.14 mIoU).</p>
+  </div>
+
+  <!-- POST-PROCESSING -->
+  <div class="section">
+    <h2>Post-Processing</h2>
+    <ul>
+      <li><strong>Point confidence:</strong> softmax &lt; 0.3 &rarr; background</li>
+      <li><strong>DBSCAN:</strong> per-class eps/min_samples tuned from GT stats</li>
+      <li><strong>Cable merging:</strong> collinear clusters within 15&deg; / 10m gap</li>
+      <li><strong>Box confidence:</strong> mean softmax &ge; 0.6 per box</li>
+      <li><strong>Size filter:</strong> min points + max dim per class</li>
+      <li><strong>NMS:</strong> IoU &gt; 0.3 suppression within each class</li>
+    </ul>
+    <p class="small">Reduced from 244 to 5.2 boxes/frame (GT: 5.1). Optional TTA (4x Z-rotation).</p>
+  </div>
+
+  <!-- RESULTS -->
+  <div class="section result">
+    <h2>Results &amp; Density Robustness</h2>
+    <div style="display: flex; gap: 12px;">
+      <div style="flex: 1;">
+        <table>
+          <tr><th>Class</th><th>Seg. IoU</th></tr>
+          <tr><td>Antenna</td><td>0.310</td></tr>
+          <tr><td>Cable</td><td>0.397</td></tr>
+          <tr><td>Electric Pole</td><td>0.004</td></tr>
+          <tr><td>Wind Turbine</td><td>0.136</td></tr>
+          <tr><td><strong>Obstacle mIoU</strong></td><td><strong>0.212</strong></td></tr>
+        </table>
+      </div>
+      <div style="flex: 1;">
+        <table>
+          <tr><th>Density</th><th>Boxes</th><th>Retention</th></tr>
+          <tr><td>100%</td><td>508 (5.1/fr)</td><td>100%</td></tr>
+          <tr><td>75%</td><td>542 (5.4/fr)</td><td>107%</td></tr>
+          <tr><td>50%</td><td>477 (4.8/fr)</td><td>94%</td></tr>
+          <tr><td>25%</td><td>339 (3.4/fr)</td><td>67%</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  Team AirBrain &mdash; Quentin, Massyl &amp; Ghania &mdash; Airbus AI Hackathon 2026 &mdash; PointNetSegV4, 1,882,693 parameters
+</div>
+
+</body>
+</html>
